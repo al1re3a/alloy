@@ -1,3 +1,34 @@
+<!-- readme-refresh:start -->
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/readme-banner.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/readme-banner.png">
+    <img alt="Grafana Alloy fork banner" src="assets/readme-banner.png" width="100%">
+  </picture>
+</p>
+
+<p align="center">
+  <img alt="Repository type: fork" src="https://img.shields.io/badge/Repository-Personal_Fork-8b5cf6?logo=github">
+  <a href="https://github.com/grafana/alloy"><img alt="Open upstream" src="https://img.shields.io/badge/Upstream-open-111827?style=for-the-badge&logo=github"></a>
+</p>
+
+> [!IMPORTANT]
+> This is a personal public fork of [Grafana Alloy](https://github.com/grafana/alloy). The documentation, release badges, support statements, and community links below are maintained by and refer to the upstream project unless a section explicitly says otherwise.
+
+<details>
+<summary><strong>🔀 Fork information</strong></summary>
+
+| | |
+|---|---|
+| **Fork owner** | [al1re3a](https://github.com/al1re3a) |
+| **Upstream** | [Grafana Alloy](https://github.com/grafana/alloy) |
+| **Documentation** | Preserved from upstream below |
+
+</details>
+
+---
+<!-- readme-refresh:end -->
+
 <p align="center">
     <img src="docs/sources/assets/logo_alloy_light.svg#gh-dark-mode-only" alt="Grafana Alloy logo" height="100px">
     <img src="docs/sources/assets/logo_alloy_dark.svg#gh-light-mode-only" alt="Grafana Alloy logo" height="100px">
