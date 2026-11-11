@@ -31,6 +31,10 @@ import (
 	"github.com/grafana/alloy/internal/component/loki/source/internal/positions"
 )
 
+// positionCleanupTimeout bounds the container inspection that decides whether a
+// removed target keeps its position.
+const positionCleanupTimeout = 5 * time.Second
+
 // tailer for Docker container logs.
 type tailer struct {
 	logger            *slog.Logger
@@ -92,7 +96,7 @@ func (t *tailer) Run(ctx context.Context) {
 	defer ticker.Stop()
 
 	// start on initial call to Run.
-	t.startIfNotRunning()
+	t.startIfNotRunning(ctx)
 
 	for {
 		select {
@@ -102,6 +106,7 @@ func (t *tailer) Run(ctx context.Context) {
 				if cerrdefs.IsNotFound(err) {
 					t.logger.Info("container no longer exists, stopping tailer", "id", t.containerID)
 					t.stop()
+					t.positions.Remove(positions.CursorKey(t.containerID), t.labelsStr)
 					return
 				}
 				if !errors.Is(err, context.Canceled) {
@@ -117,26 +122,61 @@ func (t *tailer) Run(ctx context.Context) {
 			}
 
 			if res.Container.State.Running || finished.Unix() >= t.last.Load() {
-				t.startIfNotRunning()
+				t.startIfNotRunning(ctx)
 			}
 		case <-ctx.Done():
 			t.stop()
+			t.cleanupPosition()
 			return
 		}
 	}
 }
 
+// cleanupPosition decides what happens to the position once the tailer's target
+// is gone from the component. A container that is merely stopped keeps its
+// position, so that it resumes where the tailer left off when it starts again.
+func (t *tailer) cleanupPosition() {
+	// The component is shutting down: every target keeps its position.
+	if t.componentStopping() {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), positionCleanupTimeout)
+	defer cancel()
+
+	res, err := t.client.ContainerInspect(ctx, t.containerID, client.ContainerInspectOptions{})
+	switch {
+	case cerrdefs.IsNotFound(err):
+		// The container was removed.
+	case err != nil:
+		// The container's state is unknown, for example because the Docker daemon
+		// is unreachable. Re-reading its whole log costs more than a stale entry.
+		t.logger.Debug("keeping position, could not inspect Docker container", "id", t.containerID, "error", err)
+		return
+	case res.Container.State != nil && res.Container.State.Running:
+		// The container still runs, so it is the target itself that was removed
+		// from the component or replaced by one with other labels.
+	default:
+		// The container stopped and may start again.
+		return
+	}
+
+	t.positions.Remove(positions.CursorKey(t.containerID), t.labelsStr)
+}
+
 // startIfNotRunning starts processing container logs. The operation is idempotent, i.e. the processing cannot be started twice.
-func (t *tailer) startIfNotRunning() {
+func (t *tailer) startIfNotRunning(ctx context.Context) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	if !t.running {
 		t.logger.Debug("starting process loop", "container", t.containerID)
 
-		ctx := context.Background()
 		info, err := t.client.ContainerInspect(ctx, t.containerID, client.ContainerInspectOptions{})
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
 			t.logger.Error("could not inspect container info", "container", t.containerID, "err", err)
 			t.err = err
 			return
@@ -150,6 +190,9 @@ func (t *tailer) startIfNotRunning() {
 			Since:      strconv.FormatInt(t.since.Load(), 10),
 		})
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
 			t.logger.Error("could not fetch logs for container", "container", t.containerID, "err", err)
 			t.err = err
 			return
@@ -164,7 +207,9 @@ func (t *tailer) startIfNotRunning() {
 	}
 }
 
-// stop shuts down the target.
+// stop shuts down the processing of the container's logs. It also runs when a
+// log stream ends on its own, with the tailer still scheduled, so it leaves the
+// position alone.
 func (t *tailer) stop() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -176,28 +221,6 @@ func (t *tailer) stop() {
 		}
 		t.wg.Wait()
 		t.logger.Debug("stopped Docker target", "container", t.containerID)
-
-		t.removePositionIfContainerDeleted()
-	}
-}
-
-func (t *tailer) removePositionIfContainerDeleted() {
-	if t.componentStopping() || t.client == nil {
-		return
-	}
-
-	_, err := t.client.ContainerInspect(context.Background(), t.containerID, client.ContainerInspectOptions{})
-	switch {
-	case err == nil:
-		// The target may have disappeared because the container stopped. Keep its
-		// position so a later restart resumes where the tailer left off.
-		return
-	case cerrdefs.IsNotFound(err):
-		t.positions.Remove(positions.CursorKey(t.containerID), t.labelsStr)
-	default:
-		// Preserve the position when the container's state cannot be determined.
-		// Re-reading logs is more harmful than retaining a stale cursor.
-		t.logger.Warn("could not determine whether to remove Docker container position", "id", t.containerID, "error", err)
 	}
 }
 
@@ -299,11 +322,15 @@ func extractTsFromBytes(line []byte) (time.Time, []byte, error) {
 }
 
 func (t *tailer) process(r io.Reader, logStreamLset model.LabelSet) {
-	const maxCapacity = dockerMaxChunkSize * 64
+	const (
+		// initialBufSize is the size that bufio.Scanner would allocate without a Buffer call.
+		initialBufSize = 4096
+		maxCapacity    = dockerMaxChunkSize * 64
+	)
 
 	reader := bufio.NewReader(r)
 	scanner := bufio.NewScanner(reader)
-	buf := make([]byte, 0, maxCapacity)
+	buf := make([]byte, 0, initialBufSize)
 	scanner.Buffer(buf, maxCapacity)
 
 	for {
