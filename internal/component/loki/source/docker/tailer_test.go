@@ -262,66 +262,111 @@ func TestTailerStopsWhenContainerNotFound(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("tailer did not stop after container was removed")
 	}
+
+	pos, err := tailer.positions.Get(positions.CursorKey(tailer.containerID), tailer.labelsStr)
+	require.NoError(t, err)
+	require.Zero(t, pos, "the removed container kept its position")
 }
 
-func TestTailerPositionCleanup(t *testing.T) {
+// A log stream ends when its container stops, and also when the connection to
+// the Docker daemon drops under a running container. The tailer stays scheduled
+// and resumes from its position, so the end of a stream must leave it in place.
+func TestTailerKeepsPositionWhenStreamEnds(t *testing.T) {
+	mock := clientMock{
+		logLine:    "2024-05-02T13:11:55.879889Z some log line",
+		running:    func() bool { return false },
+		finishedAt: func() string { return "0001-01-01T00:00:00Z" },
+	}
+
+	tailer, entryHandler := setupTailer(t, mock)
+	go tailer.Run(t.Context())
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.NotEmpty(c, entryHandler.Received())
+	}, 5*time.Second, 20*time.Millisecond, "expected the container's log line to be shipped")
+	require.Eventually(t, func() bool {
+		tailer.mu.Lock()
+		defer tailer.mu.Unlock()
+		return !tailer.running
+	}, 5*time.Second, 20*time.Millisecond, "expected the log stream to end")
+
+	pos, err := tailer.positions.Get(positions.CursorKey(tailer.containerID), tailer.labelsStr)
+	require.NoError(t, err)
+	require.NotZero(t, pos, "the end of a log stream removed the container's position")
+}
+
+// When a target leaves the component, its position is removed unless the
+// container is merely stopped: a stopped container can start again and must
+// then resume where the tailer left off.
+func TestTailerPositionWhenTargetIsRemoved(t *testing.T) {
+	const seeded = int64(1714655515)
+
 	tests := []struct {
 		name              string
+		running           bool
+		inspectErr        error // returned by the container inspection once the target is removed
 		componentStopping bool
-		inspectErr        error
-		wantRemoved       bool
+		wantKept          bool
 	}{
-		{
-			name: "stopped container preserves position",
-		},
-		{
-			name:        "removed container deletes position",
-			inspectErr:  cerrdefs.ErrNotFound,
-			wantRemoved: true,
-		},
-		{
-			name:       "inspect error preserves position",
-			inspectErr: errors.New("inspect failed"),
-		},
-		{
-			name:              "component shutdown preserves position",
-			componentStopping: true,
-		},
+		{name: "stopped container keeps its position", wantKept: true},
+		{name: "running container loses its position", running: true},
+		{name: "removed container loses its position", running: true, inspectErr: cerrdefs.ErrNotFound},
+		{name: "unknown container state keeps the position", running: true, inspectErr: errors.New("cannot connect to the Docker daemon"), wantKept: true},
+		{name: "component shutdown keeps the position", running: true, componentStopping: true, wantKept: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			pos := &trackingPositions{Positions: positions.NewNop()}
+			var (
+				inspects = atomic.NewInt32(0)
+				removed  = atomic.NewBool(false)
+			)
 			mock := clientMock{
-				running:    func() bool { return false },
+				logLine:    "2024-05-02T13:11:55.879889Z some log line",
+				running:    func() bool { return tt.running },
 				finishedAt: func() string { return "0001-01-01T00:00:00Z" },
-				inspectErr: func() error { return tt.inspectErr },
-			}
-			tailer := &tailer{
-				logger:            logging.NewSlogNop(),
-				positions:         pos,
-				containerID:       "container-id",
-				labelsStr:         "{}",
-				client:            mock,
-				componentStopping: func() bool { return tt.componentStopping },
-				running:           true,
-				cancel:            func() {},
+				inspectErr: func() error {
+					inspects.Add(1)
+					if removed.Load() {
+						return tt.inspectErr
+					}
+					return nil
+				},
 			}
 
-			tailer.stop()
+			tailer, _ := setupTailer(t, mock)
+			tailer.componentStopping = func() bool { return tt.componentStopping }
+			tailer.positions.Put(positions.CursorKey(tailer.containerID), tailer.labelsStr, seeded)
 
-			require.Equal(t, tt.wantRemoved, pos.removed)
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan struct{})
+			go func() {
+				tailer.Run(ctx)
+				close(done)
+			}()
+
+			// Let the tailer start and see a restart tick before its target goes away.
+			require.Eventually(t, func() bool {
+				return inspects.Load() >= 2
+			}, 5*time.Second, restartInterval, "expected the tailer to inspect its container")
+			removed.Store(true)
+			cancel()
+
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("tailer did not stop after its target was removed")
+			}
+
+			pos, err := tailer.positions.Get(positions.CursorKey(tailer.containerID), tailer.labelsStr)
+			require.NoError(t, err)
+			if tt.wantKept {
+				require.NotZero(t, pos, "the position was removed")
+			} else {
+				require.Zero(t, pos, "the position was kept")
+			}
 		})
 	}
-}
-
-type trackingPositions struct {
-	positions.Positions
-	removed bool
-}
-
-func (p *trackingPositions) Remove(_, _ string) {
-	p.removed = true
 }
 
 var _ io.ReadCloser = (*stringReader)(nil)
